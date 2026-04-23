@@ -1,0 +1,261 @@
+import sys
+import itertools
+import threading
+import time
+import tty
+import termios
+import select
+
+from mlx_lm import load, stream_generate
+
+# DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-4bit"
+
+DEFAULT_MAX_TOKENS = 2048
+
+AVAILABLE_MODELS = [
+    "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "mlx-community/Qwen3.5-9B-4bit",
+]
+
+THINK_END = "</think>"
+_THINKING_MODELS = ["Qwen3"]
+
+
+class Spinner:
+    def __init__(self, message: str = "思考中"):
+        self._message = message
+        self._stop = False
+        self._thread = None
+
+    def start(self):
+        self._stop = False
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join()
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+    def _spin(self):
+        for frame in itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]):
+            if self._stop:
+                break
+            sys.stdout.write(f"\r{frame} {self._message}")
+            sys.stdout.flush()
+            time.sleep(0.1)
+
+
+class EscListener:
+    """后台线程监听 Esc 键，按下后设置标志位。"""
+
+    def __init__(self):
+        self._pressed = False
+        self._stop = False
+        self._thread = None
+        self._old_settings = None
+
+    @property
+    def pressed(self) -> bool:
+        return self._pressed
+
+    def start(self):
+        self._pressed = False
+        self._stop = False
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=0.3)
+        # 恢复终端设置
+        if self._old_settings is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
+            self._old_settings = None
+
+    def _listen(self):
+        fd = sys.stdin.fileno()
+        self._old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop:
+                if select.select([fd], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == "\x1b":  # Esc
+                        self._pressed = True
+                        break
+        except Exception:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, self._old_settings)
+            self._old_settings = None
+
+
+class LocalModel:
+    """MLX 本地模型封装：加载、流式生成、切换模型。"""
+
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model_name = model_name
+        self.max_tokens = DEFAULT_MAX_TOKENS
+        self.thinking_enabled = False
+        self.last_thinking: str | None = None  # 最近一次思考内容
+        self._extracting = False  # 防止重入
+        self._interrupted = False  # 是否被 Esc 打断
+        self._load(model_name)
+
+    def _load(self, model_name: str):
+        print(f"正在加载模型: {model_name} ...")
+        self.model, self.tokenizer = load(model_name)
+        self.model_name = model_name
+        self._has_thinking = any(k in model_name for k in _THINKING_MODELS)
+        print("模型加载完成。")
+
+    def switch(self, model_name: str):
+        if model_name == self.model_name:
+            print(f"当前已经是 {model_name}，无需切换。")
+            return
+        self._load(model_name)
+
+    def chat(self, messages: list[dict]) -> str:
+        # 决定是否启用 thinking
+        use_thinking = self._has_thinking and self.thinking_enabled
+        self._interrupted = False
+
+        # 从用户发送消息起就开始转圈
+        spinner = Spinner()
+        spinner.start()
+
+        # 启动 Esc 监听
+        esc = EscListener()
+        esc.start()
+
+        template_kwargs = {}
+        if self._has_thinking:
+            template_kwargs["enable_thinking"] = use_thinking
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+
+        gen = stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            max_tokens=self.max_tokens,
+        )
+
+        self.last_thinking = None
+        try:
+            if use_thinking:
+                return self._stream_with_thinking(gen, spinner, esc)
+            else:
+                return self._stream_direct(gen, spinner, esc)
+        finally:
+            esc.stop()
+
+    def _stream_direct(self, gen, spinner: Spinner, esc: EscListener) -> str:
+        """直接流式输出，首字到达时停掉 spinner。按 Esc 可打断。"""
+        buffer = ""
+
+        for resp in gen:
+            if esc.pressed:
+                self._interrupted = True
+                if spinner:
+                    spinner.stop()
+                    spinner = None
+                print("\n（已打断）\n")
+                break
+            if spinner:
+                spinner.stop()
+                spinner = None
+                print("\n十五: ", end="", flush=True)
+            print(resp.text, end="", flush=True)
+            buffer += resp.text
+        if spinner:
+            spinner.stop()
+        if not self._interrupted:
+            print("\n")
+        return buffer.strip()
+
+    def generate_silent(self, messages: list[dict], max_tokens: int = 512) -> str:
+        """静默生成：不打印、不思考，用于后台任务（如记忆提取）。"""
+        template_kwargs = {}
+        if self._has_thinking:
+            template_kwargs["enable_thinking"] = False
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+
+        result = ""
+        for resp in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+        ):
+            result += resp.text
+        return result.strip()
+
+    def _stream_with_thinking(self, gen, spinner: Spinner, esc: EscListener) -> str:
+        """thinking 阶段转圈，回答阶段流式输出。按 Esc 可打断。"""
+        buffer = ""
+        found_end = False
+
+        for resp in gen:
+            if esc.pressed:
+                self._interrupted = True
+                spinner.stop()
+                # 保存已有的思考内容
+                thinking_text = buffer
+                for tag in ["<think>", "<think>\n"]:
+                    if thinking_text.startswith(tag):
+                        thinking_text = thinking_text[len(tag):]
+                if THINK_END in thinking_text:
+                    thinking_text = thinking_text[:thinking_text.index(THINK_END)]
+                self.last_thinking = thinking_text.strip() or None
+                print("\n（已打断）\n")
+                answer_start = buffer.index(THINK_END) + len(THINK_END) if found_end else len(buffer)
+                return buffer[answer_start:].strip()
+
+            buffer += resp.text
+
+            if not found_end and THINK_END in buffer:
+                found_end = True
+                spinner.stop()
+                answer_start = buffer.index(THINK_END) + len(THINK_END)
+                answer_so_far = buffer[answer_start:].lstrip()
+                print(f"\n十五: {answer_so_far}", end="", flush=True)
+                continue
+
+            if found_end:
+                print(resp.text, end="", flush=True)
+
+        if not found_end:
+            # thinking 没闭合，token 用完了
+            spinner.stop()
+            thinking_text = buffer
+            for tag in ["<think>", "<think>\n"]:
+                if thinking_text.startswith(tag):
+                    thinking_text = thinking_text[len(tag):]
+            self.last_thinking = thinking_text.strip()
+            print("\n十五: （思考未完成，用 /thinking 查看思考内容，/tokens <数量> 增大上限）\n")
+            return ""
+
+        print("\n")
+        answer_start = buffer.index(THINK_END) + len(THINK_END)
+        think_start = 0
+        for tag in ["<think>", "<think>\n"]:
+            if buffer.startswith(tag):
+                think_start = len(tag)
+                break
+        self.last_thinking = buffer[think_start:buffer.index(THINK_END)].strip()
+        return buffer[answer_start:].strip()

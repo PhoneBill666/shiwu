@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+AGENTS.md
+
+# User data (memories, logs, sessions)
+data/
+
+# Shared files (user-uploaded)
+shared_files/
+
+# Reference project (not part of this repo)
+claude-code-haha-main/
+
