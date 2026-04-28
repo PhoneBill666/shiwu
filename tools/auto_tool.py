@@ -1,6 +1,6 @@
 """自动工具调用：检测模型回复中的工具标记并执行。
 
-支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output]
+支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output] [CANVAS:days]
 """
 
 import re
@@ -8,10 +8,11 @@ import re
 from tools.web import web_search, web_fetch
 from tools.file_reader import read_file
 from tools.pdf_tools import pdf_merge
+from tools.canvas import get_canvas_schedule, normalize_canvas_days
 from core.model import Spinner
 
 # 匹配所有工具标记
-_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE):([^\]]+)\]")
+_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS):([^\]]+)\]")
 
 # 最多执行几次工具调用（防止循环）
 MAX_TOOL_CALLS = 5
@@ -63,4 +64,17 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
             result = pdf_merge(folder, output)
             spinner.stop()
             results.append(f"【PDF 合并】\n{result}")
+        elif action == "CANVAS":
+            spinner = Spinner("获取 Canvas 日程中")
+            spinner.start()
+            try:
+                days = normalize_canvas_days(argument)
+                result = get_canvas_schedule(days=days)
+            except ValueError as e:
+                result = str(e)
+            spinner.stop()
+            results.append(
+                f"【Canvas 未来 {argument} 天日程】\n"
+                f"以下是系统抓取的临时外部数据，不属于用户长期记忆。\n{result}"
+            )
     return "\n\n".join(results)

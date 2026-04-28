@@ -11,6 +11,15 @@ from memory.llm_extractor import try_llm_extract, reextract_from_logs_llm
 from prompts.system import SYSTEM_PROMPT
 from tools.web import web_search, web_fetch
 from tools.auto_tool import detect_tool_calls, execute_tool_calls
+from tools.canvas import (
+    DEFAULT_CANVAS_DAYS,
+    canvas_status,
+    clear_canvas_feed_url,
+    get_canvas_schedule,
+    normalize_canvas_days,
+    save_canvas_feed_url,
+    should_auto_check_canvas,
+)
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
 from tools.pdf_tools import pdf_merge
 
@@ -35,6 +44,7 @@ COMMANDS = {
     "/tokens <数量>": "设置 max_tokens",
     "/search <关键词>": "联网搜索（DuckDuckGo）",
     "/fetch <url>": "抓取网页内容",
+    "/canvas": "查看或配置 Canvas Calendar Feed 日程",
     "/files": "列出 shared_files/ 中可用 @引用 的文件",
     "/pdfmerge <文件夹> <输出名>": "合并文件夹内所有 PDF",
     "/help": "显示可用命令",
@@ -229,6 +239,47 @@ def main():
             conv.add_assistant(reply)
             mem.append_log("assistant", reply)
             continue
+        elif user_input == "/canvas":
+            print(f"{get_canvas_schedule(days=DEFAULT_CANVAS_DAYS)}\n")
+            continue
+        elif user_input.startswith("/canvas "):
+            arg = user_input[len("/canvas "):].strip()
+            if arg.startswith("set-feed "):
+                feed_url = arg[len("set-feed "):].strip()
+                if not feed_url:
+                    print("请粘贴完整的 Canvas Calendar Feed 链接。\n")
+                    continue
+                try:
+                    save_canvas_feed_url(feed_url)
+                except ValueError as e:
+                    print(f"{e}\n")
+                    continue
+                print("Canvas Calendar Feed 已保存。之后输入 /canvas 就能查看近期作业、考试和日程。\n")
+                continue
+            if arg == "clear-feed":
+                removed = clear_canvas_feed_url()
+                if removed:
+                    print("Canvas Calendar Feed 配置已清除。\n")
+                else:
+                    print("当前没有可清除的 Canvas Feed 配置。\n")
+                continue
+            if arg == "status":
+                print(f"{canvas_status()}\n")
+                continue
+            try:
+                days = normalize_canvas_days(arg)
+            except ValueError:
+                print(
+                    "Canvas 用法：\n"
+                    "  /canvas\n"
+                    "  /canvas 7\n"
+                    "  /canvas set-feed <Calendar Feed 链接>\n"
+                    "  /canvas status\n"
+                    "  /canvas clear-feed\n"
+                )
+                continue
+            print(f"{get_canvas_schedule(days=days)}\n")
+            continue
         elif user_input == "/files":
             files = list_shared_files()
             if files:
@@ -270,10 +321,27 @@ def main():
             if not user_input:
                 user_input = "请阅读并总结以下文件内容。"
 
+        canvas_context = ""
+        skip_memory_extract = False
+        if should_auto_check_canvas(user_input):
+            canvas_context = get_canvas_schedule(days=DEFAULT_CANVAS_DAYS)
+            skip_memory_extract = True
+
         mem.append_log("user", user_input)
 
-        if file_context:
+        if file_context and canvas_context:
+            conv.add_user(
+                f"{user_input}\n\n{file_context}\n\n"
+                f"【系统临时注入的 Canvas 日程，不属于用户长期记忆】\n{canvas_context}"
+            )
+        elif file_context:
             conv.add_user(f"{user_input}\n\n{file_context}")
+        elif canvas_context:
+            conv.add_user(
+                f"{user_input}\n\n"
+                f"【系统临时注入的 Canvas 日程，不属于用户长期记忆】\n{canvas_context}\n\n"
+                "请基于这些安排回答，并主动提醒临近 due、考试或重要日程。"
+            )
         else:
             conv.add_user(user_input)
         messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input)
@@ -295,6 +363,7 @@ def main():
         # 检测模型是否想调用工具
         tool_calls = detect_tool_calls(reply)
         if tool_calls:
+            skip_memory_extract = True
             # 执行工具调用
             tool_results = execute_tool_calls(tool_calls)
             # 把第一轮回复（含标记）和工具结果都加入对话
@@ -316,7 +385,8 @@ def main():
         mem.append_log("assistant", reply)
 
         # LLM 记忆提取：分析最近对话，自动提取值得长期记住的信息
-        try_llm_extract(model, conv.history, mem)
+        if not skip_memory_extract:
+            try_llm_extract(model, conv.history, mem)
 
 
 if __name__ == "__main__":
