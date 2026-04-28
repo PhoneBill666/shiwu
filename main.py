@@ -12,6 +12,7 @@ from prompts.system import SYSTEM_PROMPT
 from tools.web import web_search, web_fetch
 from tools.auto_tool import detect_tool_calls, execute_tool_calls
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
+from tools.pdf_tools import pdf_merge
 
 REMEMBER_KIND_RE = re.compile(
     r"^(user_identity|user_preference|project_context|technical_constraint|assistant_identity|other|manual)\s*[:：]\s*(.+)$"
@@ -35,6 +36,7 @@ COMMANDS = {
     "/search <关键词>": "联网搜索（DuckDuckGo）",
     "/fetch <url>": "抓取网页内容",
     "/files": "列出 shared_files/ 中可用 @引用 的文件",
+    "/pdfmerge <文件夹> <输出名>": "合并文件夹内所有 PDF",
     "/help": "显示可用命令",
 }
 
@@ -236,6 +238,18 @@ def main():
                 print()
             else:
                 print("shared_files/ 目录为空，把文件拖进去即可用 @文件名 引用。\n")
+            continue
+        elif user_input.startswith("/pdfmerge "):
+            args = user_input[len("/pdfmerge "):].strip().split(None, 1)
+            if len(args) < 2:
+                print("用法: /pdfmerge <文件夹路径> <输出文件名>\n示例: /pdfmerge ~/Desktop/pdfs merged.pdf\n")
+                continue
+            folder_path, output_name = args
+            spinner = Spinner("合并 PDF 中")
+            spinner.start()
+            result = pdf_merge(folder_path, output_name)
+            spinner.stop()
+            print(f"\n{result}\n")
             continue
         elif user_input == "/help":
             print_help()

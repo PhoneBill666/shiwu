@@ -1,13 +1,17 @@
-"""自动工具调用：检测模型回复中的 [SEARCH:...] / [FETCH:...] / [FILE:...] 标记并执行。"""
+"""自动工具调用：检测模型回复中的工具标记并执行。
+
+支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output]
+"""
 
 import re
 
 from tools.web import web_search, web_fetch
 from tools.file_reader import read_file
+from tools.pdf_tools import pdf_merge
 from core.model import Spinner
 
-# 匹配 [SEARCH:...] / [FETCH:...] / [FILE:...]
-_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE):([^\]]+)\]")
+# 匹配所有工具标记
+_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE):([^\]]+)\]")
 
 # 最多执行几次工具调用（防止循环）
 MAX_TOOL_CALLS = 5
@@ -48,4 +52,15 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
             result = read_file(path)
             spinner.stop()
             results.append(f"【文件: {argument}】\n{result}")
+        elif action == "PDFMERGE":
+            parts = argument.split("|", 1)
+            if len(parts) == 2:
+                folder, output = parts[0].strip(), parts[1].strip()
+            else:
+                folder, output = argument.strip(), "merged.pdf"
+            spinner = Spinner("合并 PDF 中")
+            spinner.start()
+            result = pdf_merge(folder, output)
+            spinner.stop()
+            results.append(f"【PDF 合并】\n{result}")
     return "\n\n".join(results)
