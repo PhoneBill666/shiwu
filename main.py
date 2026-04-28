@@ -15,9 +15,15 @@ from tools.canvas import (
     DEFAULT_CANVAS_DAYS,
     canvas_status,
     clear_canvas_feed_url,
+    get_canvas_context_for_query,
+    get_canvas_history_for_query,
     get_canvas_schedule,
+    mark_canvas_events_completed,
+    mark_canvas_events_pending,
     normalize_canvas_days,
     save_canvas_feed_url,
+    should_mark_canvas_completed,
+    should_mark_canvas_pending,
     should_auto_check_canvas,
 )
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
@@ -45,6 +51,9 @@ COMMANDS = {
     "/search <关键词>": "联网搜索（DuckDuckGo）",
     "/fetch <url>": "抓取网页内容",
     "/canvas": "查看或配置 Canvas Calendar Feed 日程",
+    "/canvas history <日期>": "查看 Canvas 历史缓存中的过去日程",
+    "/canvas done <内容>": "将匹配到的 Canvas 事件标记为已完成",
+    "/canvas undo <内容>": "将匹配到的 Canvas 事件改回未完成",
     "/files": "列出 shared_files/ 中可用 @引用 的文件",
     "/pdfmerge <文件夹> <输出名>": "合并文件夹内所有 PDF",
     "/help": "显示可用命令",
@@ -205,7 +214,7 @@ def main():
                 f"{raw_results}"
             )
             mem.append_log("user", f"/search {query}")
-            messages = build_messages(SYSTEM_PROMPT, conv, mem, query)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, query, model.model_name)
             try:
                 reply = model.chat(messages)
             except Exception as e:
@@ -229,7 +238,7 @@ def main():
                 f"我抓取了这个网页的内容，请帮我总结要点：\n\n{raw_content}"
             )
             mem.append_log("user", f"/fetch {url}")
-            messages = build_messages(SYSTEM_PROMPT, conv, mem, url)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, url, model.model_name)
             try:
                 reply = model.chat(messages)
             except Exception as e:
@@ -266,6 +275,27 @@ def main():
             if arg == "status":
                 print(f"{canvas_status()}\n")
                 continue
+            if arg.startswith("history "):
+                history_query = arg[len("history "):].strip()
+                if not history_query:
+                    print("请提供日期或时间描述，例如: /canvas history 2026-03-31\n")
+                    continue
+                print(f"{get_canvas_history_for_query(history_query)}\n")
+                continue
+            if arg.startswith("done "):
+                completion_query = arg[len("done "):].strip()
+                if not completion_query:
+                    print("请提供事件描述，例如: /canvas done Journal 3\n")
+                    continue
+                print(f"{mark_canvas_events_completed(completion_query)}\n")
+                continue
+            if arg.startswith("undo "):
+                undo_query = arg[len("undo "):].strip()
+                if not undo_query:
+                    print("请提供事件描述，例如: /canvas undo Lab 6\n")
+                    continue
+                print(f"{mark_canvas_events_pending(undo_query)}\n")
+                continue
             try:
                 days = normalize_canvas_days(arg)
             except ValueError:
@@ -273,6 +303,9 @@ def main():
                     "Canvas 用法：\n"
                     "  /canvas\n"
                     "  /canvas 7\n"
+                    "  /canvas history 2026-03-31\n"
+                    "  /canvas done Journal 3\n"
+                    "  /canvas undo Lab 6\n"
                     "  /canvas set-feed <Calendar Feed 链接>\n"
                     "  /canvas status\n"
                     "  /canvas clear-feed\n"
@@ -311,6 +344,24 @@ def main():
 
         # ---- 对话处理 ----
 
+        if should_mark_canvas_pending(user_input):
+            result = mark_canvas_events_pending(user_input)
+            print(f"{result}\n")
+            conv.add_user(user_input)
+            conv.add_assistant(result)
+            mem.append_log("user", user_input)
+            mem.append_log("assistant", result)
+            continue
+
+        if should_mark_canvas_completed(user_input):
+            result = mark_canvas_events_completed(user_input)
+            print(f"{result}\n")
+            conv.add_user(user_input)
+            conv.add_assistant(result)
+            mem.append_log("user", user_input)
+            mem.append_log("assistant", result)
+            continue
+
         # 检测用户输入中的文件引用（@文件名 或 [/路径]）
         file_refs = parse_file_references(user_input)
         file_context = ""
@@ -324,7 +375,7 @@ def main():
         canvas_context = ""
         skip_memory_extract = False
         if should_auto_check_canvas(user_input):
-            canvas_context = get_canvas_schedule(days=DEFAULT_CANVAS_DAYS)
+            canvas_context = get_canvas_context_for_query(user_input, days=DEFAULT_CANVAS_DAYS)
             skip_memory_extract = True
 
         mem.append_log("user", user_input)
@@ -341,10 +392,11 @@ def main():
                 f"{user_input}\n\n"
                 f"【系统临时注入的 Canvas 日程，不属于用户长期记忆】\n{canvas_context}\n\n"
                 "请基于这些安排回答，并主动提醒临近 due、考试或重要日程。"
+                "如果系统已经明确标注了今天/明天/后天，就直接沿用，不要自己改写时间关系。"
             )
         else:
             conv.add_user(user_input)
-        messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input)
+        messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
 
         try:
             reply = model.chat(messages)
@@ -373,7 +425,7 @@ def main():
                 f"要求：直接用自然语言总结要点，回答末尾附上引用来源链接。\n\n"
                 f"{tool_results}"
             )
-            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
             try:
                 reply = model.chat(messages)
             except Exception as e:

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from core.temporal_context import format_temporal_ranges, resolve_temporal_ranges
 from memory.memory_policy import (
     KIND_ALIASES,
     SUPPORTED_MEMORY_KINDS,
@@ -15,11 +16,11 @@ from memory.memory_policy import (
     infer_explicit,
     is_low_value_memory_content,
 )
+from storage_paths import MEMORY_LOG_FILE, MEMORIES_FILE, MEMORY_TOMBSTONES_FILE, prepare_storage_layout
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DEFAULT_LOG_FILE = DATA_DIR / "memory_log.jsonl"
-DEFAULT_MEMORIES_FILE = DATA_DIR / "memories.json"
-DEFAULT_TOMBSTONES_FILE = DATA_DIR / "memory_tombstones.json"
+DEFAULT_LOG_FILE = MEMORY_LOG_FILE
+DEFAULT_MEMORIES_FILE = MEMORIES_FILE
+DEFAULT_TOMBSTONES_FILE = MEMORY_TOMBSTONES_FILE
 
 
 def _now_iso() -> str:
@@ -65,6 +66,7 @@ class MemoryStore:
         memories_file: Path = DEFAULT_MEMORIES_FILE,
         tombstones_file: Path = DEFAULT_TOMBSTONES_FILE,
     ):
+        prepare_storage_layout()
         self.log_file = log_file
         self.memories_file = memories_file
         self.tombstones_file = tombstones_file
@@ -226,6 +228,47 @@ class MemoryStore:
         if limit is not None and limit > 0:
             return rows[-limit:]
         return rows
+
+    def build_temporal_log_context(self, query: str, limit: int = 12) -> str:
+        ranges = resolve_temporal_ranges(query)
+        if not ranges:
+            return ""
+
+        rows = self.search_logs_by_ranges(ranges, limit=limit)
+        lines = [
+            "【历史对话时间线】以下记录来自 memory_log，带真实时间戳。",
+            "回答过去发生了什么时，应优先参考这些记录，不要把它们描述成刚刚发生。",
+            format_temporal_ranges(ranges),
+        ]
+        if not rows:
+            lines.append("- 这些时间范围内没有查到对话记录。")
+            return "\n".join(line for line in lines if line)
+
+        for row in rows:
+            timestamp = self._parse_timestamp(row.get("timestamp"))
+            if timestamp is None:
+                stamp = "时间未知"
+            else:
+                stamp = timestamp.strftime("%Y-%m-%d %H:%M")
+            role = "用户" if row.get("role") == "user" else "助手"
+            content = str(row.get("content", "")).replace("\n", " ").strip()
+            if len(content) > 120:
+                content = content[:120] + "..."
+            lines.append(f"- {stamp} [{role}] {content}")
+        return "\n".join(lines)
+
+    def search_logs_by_ranges(self, ranges: list[dict[str, datetime]], limit: int = 12) -> list[dict]:
+        rows = self.iter_logs()
+        matched: list[dict] = []
+        for row in rows:
+            timestamp = self._parse_timestamp(row.get("timestamp"))
+            if timestamp is None:
+                continue
+            if any(item["start"] <= timestamp <= item["end"] for item in ranges):
+                matched.append(row)
+        if len(matched) <= limit:
+            return matched
+        return matched[-limit:]
 
     # ---- 持久化 ----
 
@@ -392,3 +435,12 @@ class MemoryStore:
             "description": description,
             "explicit": explicit,
         }
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None

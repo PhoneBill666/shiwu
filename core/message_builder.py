@@ -1,10 +1,8 @@
-from datetime import datetime
-
+from core.temporal_context import build_runtime_context, query_mentions_past_time
 from memory.conversation import Conversation
 from memory.memory_retriever import retrieve, format_for_prompt
 from memory.memory_store import MemoryStore
 
-WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 FACT_QUERY_HINTS = [
     "你是谁",
     "你叫什么",
@@ -20,16 +18,11 @@ def build_messages(
     conversation: Conversation,
     memory_store: MemoryStore,
     user_query: str,
+    model_name: str | None = None,
 ) -> list[dict[str, str]]:
     system_parts: list[str] = [system_prompt]
 
-    # 当前时间注入
-    now = datetime.now().astimezone()
-    runtime_text = (
-        f"【runtime context】当前时间: "
-        f"{now.strftime('%Y年%m月%d日')} {WEEKDAYS[now.weekday()]} {now.strftime('%H:%M')}"
-    )
-    system_parts.append(runtime_text)
+    system_parts.append(build_runtime_context(model_name=model_name))
 
     # 长期记忆
     relevant = retrieve(user_query, memory_store)
@@ -37,11 +30,25 @@ def build_messages(
     if memory_text:
         system_parts.append(memory_text)
 
+    recent_timeline = conversation.build_recent_timeline()
+    if recent_timeline:
+        system_parts.append(recent_timeline)
+
+    temporal_log_text = memory_store.build_temporal_log_context(user_query)
+    if temporal_log_text:
+        system_parts.append(temporal_log_text)
+
     if any(hint in user_query for hint in FACT_QUERY_HINTS):
         system_parts.append(
             "这是事实型问题。请优先使用 runtime context 与长期记忆。"
             "若信息未提供，请明确说不知道，不要猜测。"
             "回答后直接结束，不要反问用户“记住了吗”“对吗”“可以吗”。"
+        )
+
+    if query_mentions_past_time(user_query):
+        system_parts.append(
+            "这是带时间线的历史问题。请明确区分“过去记录”与“当前这轮对话”。"
+            "如果引用了历史日志，回答里可以直接说明是上周、某天或某个历史时间点发生的。"
         )
 
     messages: list[dict[str, str]] = [
