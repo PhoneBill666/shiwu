@@ -1,6 +1,6 @@
 """自动工具调用：检测模型回复中的工具标记并执行。
 
-支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...]
+支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...] [MAIL:query]
 """
 
 import re
@@ -10,10 +10,10 @@ from tools.file_reader import read_file
 from tools.pdf_tools import pdf_merge
 from tools.canvas import get_canvas_schedule, normalize_canvas_days
 from tools.system_status import get_system_status
-from core.model import Spinner
+from tools.mail_tool import search_mail
 
 # 匹配所有工具标记
-_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS):([^\]]+)\]")
+_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
 
 # 最多执行几次工具调用（防止循环）
@@ -38,14 +38,20 @@ def extract_tool_markers(text: str) -> str:
 
 
 def enrich_reply_with_sources(reply: str, tool_results: str, max_urls: int = 5) -> str:
-    """如果工具结果里有 URL，但模型没在最终回答里给出来源，则自动补充。"""
+    """补齐真实来源，并清理模型生成的空来源段。"""
+    reply = strip_empty_source_section(reply)
+
+    local_source = _infer_local_source_label(tool_results)
+    if local_source and not _has_web_source_marker(tool_results):
+        trimmed = reply.rstrip()
+        if not _has_source_section(reply):
+            return f"{trimmed}\n\n来源：{local_source}"
+        return reply
+
     result_urls = _extract_urls(tool_results)
     if not result_urls:
-        local_source = _infer_local_source_label(tool_results)
         if local_source:
             trimmed = reply.rstrip()
-            if re.search(r"(引用来源|来源)[:：]\s*$", trimmed):
-                return f"{trimmed}\n- {local_source}"
             if not _has_source_section(reply):
                 return f"{trimmed}\n\n来源：{local_source}"
         return reply
@@ -64,6 +70,11 @@ def enrich_reply_with_sources(reply: str, tool_results: str, max_urls: int = 5) 
     return f"{trimmed}\n\n引用来源：\n{source_lines}"
 
 
+def strip_empty_source_section(text: str) -> str:
+    """Remove a trailing empty "引用来源/来源" heading."""
+    return re.sub(r"\n+(?:引用来源|来源)[:：]\s*$", "", text.rstrip()).rstrip()
+
+
 def _has_source_section(text: str) -> bool:
     return bool(re.search(r"(引用来源|来源)[:：]", text))
 
@@ -73,11 +84,36 @@ def _infer_local_source_label(tool_results: str) -> str:
         return "本地系统状态工具（实时读取）"
     if "【Canvas " in tool_results:
         return "Canvas Calendar Feed（本地抓取）"
+    if "【邮件】" in tool_results:
+        return "macOS Mail 应用（本地读取）"
     if "【文件:" in tool_results:
         return "本地文件读取"
     if "【PDF 合并】" in tool_results:
         return "本地 PDF 合并工具"
     return ""
+
+
+def _has_web_source_marker(tool_results: str) -> bool:
+    return "【搜索" in tool_results or "【抓取 " in tool_results
+
+
+def source_instruction_for_tool_results(tool_results: str) -> str:
+    """Return a prompt instruction that matches the available source type."""
+    local_source = _infer_local_source_label(tool_results)
+    if local_source and not _has_web_source_marker(tool_results):
+        return f"回答末尾注明来源：{local_source}。"
+
+    urls = _extract_urls(tool_results)
+    if urls:
+        return "回答末尾附上你实际使用到的引用来源 URL。"
+
+    return "如果工具结果没有明确来源，不要输出“引用来源”或“来源”标题。"
+
+
+def _make_spinner(message: str):
+    from core.model import Spinner
+
+    return Spinner(message)
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -96,20 +132,20 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
     results = []
     for action, argument in calls:
         if action == "SEARCH":
-            spinner = Spinner(f"正在搜索: {argument}")
+            spinner = _make_spinner(f"正在搜索: {argument}")
             spinner.start()
             result = web_search(argument)
             spinner.stop()
             results.append(f"【搜索「{argument}」的结果】\n{result}")
         elif action == "FETCH":
-            spinner = Spinner(f"正在抓取网页: {argument}")
+            spinner = _make_spinner(f"正在抓取网页: {argument}")
             spinner.start()
             result = web_fetch(argument)
             spinner.stop()
             results.append(f"【抓取 {argument} 的内容】\n{result}")
         elif action == "FILE":
             import os
-            spinner = Spinner(f"正在读取文件: {argument}")
+            spinner = _make_spinner(f"正在读取文件: {argument}")
             spinner.start()
             path = os.path.expanduser(argument)
             result = read_file(path)
@@ -121,13 +157,13 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
                 folder, output = parts[0].strip(), parts[1].strip()
             else:
                 folder, output = argument.strip(), "merged.pdf"
-            spinner = Spinner(f"正在合并 PDF: {argument}")
+            spinner = _make_spinner(f"正在合并 PDF: {argument}")
             spinner.start()
             result = pdf_merge(folder, output)
             spinner.stop()
             results.append(f"【PDF 合并】\n{result}")
         elif action == "CANVAS":
-            spinner = Spinner(f"正在获取 Canvas 日程（未来 {argument} 天）")
+            spinner = _make_spinner(f"正在获取 Canvas 日程（未来 {argument} 天）")
             spinner.start()
             try:
                 days = normalize_canvas_days(argument)
@@ -140,9 +176,15 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
                 f"以下是系统抓取的临时外部数据，不属于用户长期记忆。\n{result}"
             )
         elif action == "STATUS":
-            spinner = Spinner(f"正在获取系统状态: {argument}")
+            spinner = _make_spinner(f"正在获取系统状态: {argument}")
             spinner.start()
             result = get_system_status(argument)
             spinner.stop()
             results.append(f"【系统状态】\n{result}")
+        elif action == "MAIL":
+            spinner = _make_spinner(f"正在读取邮件: {argument}")
+            spinner.start()
+            result = search_mail(argument)
+            spinner.stop()
+            results.append(f"【邮件】\n{result}")
     return "\n\n".join(results)

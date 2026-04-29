@@ -10,7 +10,14 @@ from memory.memory_store import MemoryStore
 from memory.llm_extractor import try_llm_extract, reextract_from_logs_llm
 from prompts.system import SYSTEM_PROMPT
 from tools.web import web_search, web_fetch
-from tools.auto_tool import detect_tool_calls, execute_tool_calls, enrich_reply_with_sources, extract_tool_markers
+from tools.auto_tool import (
+    detect_tool_calls,
+    execute_tool_calls,
+    enrich_reply_with_sources,
+    extract_tool_markers,
+    source_instruction_for_tool_results,
+    strip_empty_source_section,
+)
 from tools.canvas import (
     DEFAULT_CANVAS_DAYS,
     canvas_status,
@@ -72,12 +79,33 @@ def print_help():
 def _print_appended_reply_delta(original: str, enriched: str):
     if enriched == original:
         return
-    if enriched.startswith(original):
-        suffix = enriched[len(original):]
-        if suffix:
-            print(suffix)
-        return
-    print(f"\n{enriched}")
+
+    visible_original = strip_empty_source_section(original)
+    for base in (visible_original, original):
+        if enriched.startswith(base):
+            suffix = enriched[len(base):]
+            if suffix:
+                print(suffix)
+            return
+
+
+def _tool_result_spinner_messages(tool_calls: list[tuple[str, str]]) -> tuple[str, str]:
+    actions = {action for action, _ in tool_calls}
+    if "SEARCH" in actions:
+        return "正在整理搜索结果", "正在生成回答"
+    if "FETCH" in actions:
+        return "正在整理网页内容", "正在生成回答"
+    if "FILE" in actions:
+        return "正在整理文件内容", "正在生成回答"
+    if "PDFMERGE" in actions:
+        return "正在整理 PDF 结果", "正在生成回答"
+    if "CANVAS" in actions:
+        return "正在整理 Canvas 日程", "正在生成回答"
+    if "STATUS" in actions:
+        return "正在整理系统状态", "正在生成回答"
+    if "MAIL" in actions:
+        return "正在整理邮件结果", "正在生成回答"
+    return "正在整理工具结果", "正在生成回答"
 
 
 def main():
@@ -216,7 +244,7 @@ def main():
             if not query:
                 print("请输入搜索关键词，例如: /search Python async\n")
                 continue
-            spinner = Spinner("搜索中")
+            spinner = Spinner(f"正在搜索: {query}")
             spinner.start()
             raw_results = web_search(query)
             spinner.stop()
@@ -224,13 +252,17 @@ def main():
             conv.add_user(
                 f"我搜索了「{query}」，请根据以下搜索结果回答我的问题。\n"
                 f"要求：直接用自然语言总结要点，不要逐条罗列标题。"
-                f"回答末尾附上引用来源，格式为：链接 (简短描述)\n\n"
+                f"{source_instruction_for_tool_results(raw_results)}\n\n"
                 f"{raw_results}"
             )
             mem.append_log("user", f"/search {query}")
             messages = build_messages(SYSTEM_PROMPT, conv, mem, query, model.model_name)
             try:
-                reply = model.chat(messages)
+                reply = model.chat(
+                    messages,
+                    spinner_message="正在整理搜索结果",
+                    next_spinner_message="正在生成回答",
+                )
             except Exception as e:
                 print(f"生成回复时出错: {e}\n")
                 conv.history.pop()
@@ -246,7 +278,7 @@ def main():
             if not url:
                 print("请输入网址，例如: /fetch https://example.com\n")
                 continue
-            spinner = Spinner("抓取中")
+            spinner = Spinner(f"正在抓取网页: {url}")
             spinner.start()
             raw_content = web_fetch(url)
             spinner.stop()
@@ -257,7 +289,11 @@ def main():
             mem.append_log("user", f"/fetch {url}")
             messages = build_messages(SYSTEM_PROMPT, conv, mem, url, model.model_name)
             try:
-                reply = model.chat(messages)
+                reply = model.chat(
+                    messages,
+                    spinner_message="正在整理网页内容",
+                    next_spinner_message="正在生成回答",
+                )
             except Exception as e:
                 print(f"生成回复时出错: {e}\n")
                 conv.history.pop()
@@ -382,7 +418,11 @@ def main():
             mem.append_log("user", user_input)
             messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
             try:
-                reply = model.chat(messages)
+                reply = model.chat(
+                    messages,
+                    spinner_message="正在整理系统状态",
+                    next_spinner_message="正在生成回答",
+                )
             except Exception as e:
                 print(f"生成回复时出错: {e}\n")
                 conv.history.pop()
@@ -475,12 +515,17 @@ def main():
                 conv.add_user(
                     f"以下是你请求的工具执行结果，请据此给出完整回答。\n"
                     f"要求：直接用自然语言总结要点。不要再次请求工具。"
-                    f"回答末尾必须附上你实际使用到的引用来源 URL。\n\n"
+                    f"{source_instruction_for_tool_results(tool_results)}\n\n"
                     f"{tool_results}"
                 )
                 messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
                 try:
-                    reply = model.chat(messages)
+                    spinner_message, next_spinner_message = _tool_result_spinner_messages(tool_calls)
+                    reply = model.chat(
+                        messages,
+                        spinner_message=spinner_message,
+                        next_spinner_message=next_spinner_message,
+                    )
                 except Exception as e:
                     print(f"生成回复时出错: {e}\n")
                     conv.history.pop()

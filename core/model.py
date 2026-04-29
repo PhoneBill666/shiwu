@@ -10,7 +10,7 @@ import select
 from mlx_lm import load, stream_generate
 
 # 匹配工具标记 [ACTION:argument]
-_TOOL_MARKER_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS):([^\]]+)\]")
+_TOOL_MARKER_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
 
 # DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-4bit"
@@ -24,11 +24,82 @@ AVAILABLE_MODELS = [
 
 THINK_END = "</think>"
 _THINKING_MODELS = ["Qwen3"]
+_EMPTY_SOURCE_SECTION_RE = re.compile(r"\n+(?:引用来源|来源)[:：]?\s*$")
+_SOURCE_HEADINGS = ("引用来源：", "引用来源:", "来源：", "来源:")
+
+
+class StreamPrinter:
+    """Stream text while holding only a possible trailing source heading."""
+
+    def __init__(self, silent: bool = False):
+        self.silent = silent
+        self.pending = ""
+        self.printed_header = False
+
+    def write(self, text: str):
+        if not text:
+            return
+        if self.silent:
+            return
+
+        self.pending += text
+        match = _EMPTY_SOURCE_SECTION_RE.search(self.pending)
+        if match:
+            self._emit(self.pending[:match.start()])
+            self.pending = self.pending[match.start():]
+            return
+
+        last_newline = self.pending.rfind("\n")
+        if last_newline == -1:
+            self._emit(self.pending)
+            self.pending = ""
+            return
+
+        tail = self.pending[last_newline:]
+        if self._is_possible_source_heading(tail):
+            self._emit(self.pending[:last_newline])
+            self.pending = tail
+            return
+
+        self._emit(self.pending)
+        self.pending = ""
+
+    def finish(self):
+        if self.silent:
+            return
+        final = _EMPTY_SOURCE_SECTION_RE.sub("", self.pending.rstrip())
+        if final:
+            self._emit(final)
+        self.pending = ""
+
+    def discard(self):
+        self.pending = ""
+
+    def _emit(self, text: str):
+        if not text:
+            return
+        if not self.printed_header:
+            print("\n十五: ", end="", flush=True)
+            self.printed_header = True
+        print(text, end="", flush=True)
+
+    def _is_possible_source_heading(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        return any(heading.startswith(stripped) for heading in _SOURCE_HEADINGS)
 
 
 class Spinner:
-    def __init__(self, message: str = "思考中"):
+    def __init__(
+        self,
+        message: str = "思考中",
+        next_message: str | None = None,
+        next_message_after: float = 0.0,
+    ):
         self._message = message
+        self._next_message = next_message
+        self._next_message_after = next_message_after
         self._stop = False
         self._thread = None
 
@@ -45,9 +116,18 @@ class Spinner:
         sys.stdout.flush()
 
     def _spin(self):
+        started_at = time.monotonic()
+        switched = False
         for frame in itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]):
             if self._stop:
                 break
+            if (
+                self._next_message
+                and not switched
+                and time.monotonic() - started_at >= self._next_message_after
+            ):
+                self._message = self._next_message
+                switched = True
             sys.stdout.write(f"\r{frame} {self._message}")
             sys.stdout.flush()
             time.sleep(0.1)
@@ -124,14 +204,27 @@ class LocalModel:
             return
         self._load(model_name)
 
-    def chat(self, messages: list[dict], silent: bool = False) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        silent: bool = False,
+        spinner_message: str | None = None,
+        next_spinner_message: str | None = None,
+        next_spinner_after: float = 0.8,
+    ) -> str:
         # 决定是否启用 thinking
         use_thinking = self._has_thinking and self.thinking_enabled
         self._interrupted = False
         self._tool_detected = False  # 是否检测到工具标记
 
         # 从用户发送消息起就开始转圈
-        spinner = Spinner()
+        if spinner_message is None:
+            spinner_message = "思考中" if use_thinking else "正在生成回答"
+        spinner = Spinner(
+            spinner_message,
+            next_message=next_spinner_message,
+            next_message_after=next_spinner_after,
+        )
         spinner.start()
 
         # 启动 Esc 监听
@@ -172,7 +265,7 @@ class LocalModel:
         output_buffer = ""  # 已输出的内容
         tool_pending = False  # 是否在等待工具标记闭合
         tool_start_pos = -1  # 工具标记开始位置
-        printed_header = False
+        printer = StreamPrinter(silent=silent)
 
         for resp in gen:
             if esc.pressed:
@@ -199,25 +292,20 @@ class LocalModel:
                     tool_start_pos = bracket_pos
                     # 输出 `[` 之前的内容
                     before_bracket = buffer[len(output_buffer):bracket_pos]
-                    if before_bracket and not silent:
-                        if not printed_header:
-                            print("\n十五: ", end="", flush=True)
-                            printed_header = True
-                        print(before_bracket, end="", flush=True)
+                    if before_bracket:
+                        printer.write(before_bracket)
                         output_buffer += before_bracket
                     tool_text = buffer[tool_start_pos:]
                     match = _TOOL_MARKER_RE.match(tool_text)
                     if match:
                         self._tool_detected = True
+                        printer.discard()
                         break
                 else:
                     # 没有工具标记，正常输出
                     new_text = buffer[len(output_buffer):]
-                    if new_text and not silent:
-                        if not printed_header:
-                            print("\n十五: ", end="", flush=True)
-                            printed_header = True
-                        print(new_text, end="", flush=True)
+                    if new_text:
+                        printer.write(new_text)
                         output_buffer = buffer
             else:
                 # 正在等待工具标记闭合，检查是否匹配完成
@@ -234,17 +322,16 @@ class LocalModel:
                     tool_start_pos = -1
                     # 输出之前暂停的内容
                     new_text = buffer[len(output_buffer):]
-                    if new_text and not silent:
-                        if not printed_header:
-                            print("\n十五: ", end="", flush=True)
-                            printed_header = True
-                        print(new_text, end="", flush=True)
+                    if new_text:
+                        printer.write(new_text)
                         output_buffer = buffer
                 # else: 继续等待更多 token
 
         if spinner:
             spinner.stop()
-        if not self._interrupted and not silent:
+        if not self._interrupted and not self._tool_detected:
+            printer.finish()
+        if not self._interrupted and not silent and printer.printed_header:
             print("\n")
         return buffer.strip()
 
@@ -279,7 +366,7 @@ class LocalModel:
         output_buffer = ""  # 已输出的内容（仅回答部分）
         tool_pending = False  # 是否在等待工具标记闭合
         tool_start_pos = -1  # 工具标记开始位置（在 buffer 中）
-        printed_header = False
+        printer = StreamPrinter(silent=silent)
 
         for resp in gen:
             if esc.pressed:
@@ -307,9 +394,8 @@ class LocalModel:
                 spinner = None
                 answer_start = buffer.index(THINK_END) + len(THINK_END)
                 answer_so_far = buffer[answer_start:].lstrip()
-                if answer_so_far and not silent:
-                    print(f"\n十五: {answer_so_far}", end="", flush=True)
-                    printed_header = True
+                if answer_so_far:
+                    printer.write(answer_so_far)
                 output_buffer = buffer[:answer_start] + answer_so_far
                 continue
 
@@ -323,25 +409,20 @@ class LocalModel:
                         tool_start_pos = bracket_pos
                         # 输出 `[` 之前的内容
                         before_bracket = buffer[len(output_buffer):bracket_pos]
-                        if before_bracket and not silent:
-                            if not printed_header:
-                                print("\n十五: ", end="", flush=True)
-                                printed_header = True
-                            print(before_bracket, end="", flush=True)
+                        if before_bracket:
+                            printer.write(before_bracket)
                             output_buffer += before_bracket
                         tool_text = buffer[tool_start_pos:]
                         match = _TOOL_MARKER_RE.match(tool_text)
                         if match:
                             self._tool_detected = True
+                            printer.discard()
                             break
                     else:
                         # 没有工具标记，正常输出
                         new_text = buffer[len(output_buffer):]
-                        if new_text and not silent:
-                            if not printed_header:
-                                print("\n十五: ", end="", flush=True)
-                                printed_header = True
-                            print(new_text, end="", flush=True)
+                        if new_text:
+                            printer.write(new_text)
                             output_buffer = buffer
                 else:
                     # 正在等待工具标记闭合，检查是否匹配完成
@@ -357,11 +438,8 @@ class LocalModel:
                         tool_start_pos = -1
                         # 输出之前暂停的内容
                         new_text = buffer[len(output_buffer):]
-                        if new_text and not silent:
-                            if not printed_header:
-                                print("\n十五: ", end="", flush=True)
-                                printed_header = True
-                            print(new_text, end="", flush=True)
+                        if new_text:
+                            printer.write(new_text)
                             output_buffer = buffer
                     # else: 继续等待更多 token
 
@@ -377,7 +455,9 @@ class LocalModel:
                 print("\n十五: （思考未完成，用 /thinking 查看思考内容，/tokens <数量> 增大上限）\n")
             return ""
 
-        if not silent:
+        if not self._tool_detected:
+            printer.finish()
+        if not silent and printer.printed_header:
             print("\n")
         answer_start = buffer.index(THINK_END) + len(THINK_END)
         think_start = 0
