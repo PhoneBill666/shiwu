@@ -2,11 +2,15 @@ import sys
 import itertools
 import threading
 import time
+import re
 import tty
 import termios
 import select
 
 from mlx_lm import load, stream_generate
+
+# 匹配工具标记 [ACTION:argument]
+_TOOL_MARKER_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS):([^\]]+)\]")
 
 # DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-4bit"
@@ -120,10 +124,11 @@ class LocalModel:
             return
         self._load(model_name)
 
-    def chat(self, messages: list[dict]) -> str:
+    def chat(self, messages: list[dict], silent: bool = False) -> str:
         # 决定是否启用 thinking
         use_thinking = self._has_thinking and self.thinking_enabled
         self._interrupted = False
+        self._tool_detected = False  # 是否检测到工具标记
 
         # 从用户发送消息起就开始转圈
         spinner = Spinner()
@@ -153,15 +158,21 @@ class LocalModel:
         self.last_thinking = None
         try:
             if use_thinking:
-                return self._stream_with_thinking(gen, spinner, esc)
+                return self._stream_with_thinking(gen, spinner, esc, silent=silent)
             else:
-                return self._stream_direct(gen, spinner, esc)
+                return self._stream_direct(gen, spinner, esc, silent=silent)
         finally:
             esc.stop()
 
-    def _stream_direct(self, gen, spinner: Spinner, esc: EscListener) -> str:
-        """直接流式输出，首字到达时停掉 spinner。按 Esc 可打断。"""
+    def _stream_direct(self, gen, spinner: Spinner, esc: EscListener, silent: bool = False) -> str:
+        """直接流式输出，首字到达时停掉 spinner。按 Esc 可打断。
+        检测到工具标记时停止输出并设置 _tool_detected。
+        """
         buffer = ""
+        output_buffer = ""  # 已输出的内容
+        tool_pending = False  # 是否在等待工具标记闭合
+        tool_start_pos = -1  # 工具标记开始位置
+        printed_header = False
 
         for resp in gen:
             if esc.pressed:
@@ -169,17 +180,71 @@ class LocalModel:
                 if spinner:
                     spinner.stop()
                     spinner = None
-                print("\n（已打断）\n")
+                if not silent:
+                    print("\n（已打断）\n")
                 break
+
             if spinner:
                 spinner.stop()
                 spinner = None
-                print("\n十五: ", end="", flush=True)
-            print(resp.text, end="", flush=True)
+
             buffer += resp.text
+
+            # 检测工具标记
+            if not tool_pending:
+                # 检查是否出现 `[` 开始工具标记
+                bracket_pos = buffer.find("[", len(output_buffer))
+                if bracket_pos != -1:
+                    tool_pending = True
+                    tool_start_pos = bracket_pos
+                    # 输出 `[` 之前的内容
+                    before_bracket = buffer[len(output_buffer):bracket_pos]
+                    if before_bracket and not silent:
+                        if not printed_header:
+                            print("\n十五: ", end="", flush=True)
+                            printed_header = True
+                        print(before_bracket, end="", flush=True)
+                        output_buffer += before_bracket
+                    tool_text = buffer[tool_start_pos:]
+                    match = _TOOL_MARKER_RE.match(tool_text)
+                    if match:
+                        self._tool_detected = True
+                        break
+                else:
+                    # 没有工具标记，正常输出
+                    new_text = buffer[len(output_buffer):]
+                    if new_text and not silent:
+                        if not printed_header:
+                            print("\n十五: ", end="", flush=True)
+                            printed_header = True
+                        print(new_text, end="", flush=True)
+                        output_buffer = buffer
+            else:
+                # 正在等待工具标记闭合，检查是否匹配完成
+                tool_text = buffer[tool_start_pos:]
+                match = _TOOL_MARKER_RE.match(tool_text)
+                if match:
+                    # 匹配到完整工具标记，停止输出
+                    self._tool_detected = True
+                    # 输出工具标记之前的内容（已经在上面输出过了）
+                    break
+                elif "]" in tool_text:
+                    # 有 `]` 但不是工具标记，恢复输出
+                    tool_pending = False
+                    tool_start_pos = -1
+                    # 输出之前暂停的内容
+                    new_text = buffer[len(output_buffer):]
+                    if new_text and not silent:
+                        if not printed_header:
+                            print("\n十五: ", end="", flush=True)
+                            printed_header = True
+                        print(new_text, end="", flush=True)
+                        output_buffer = buffer
+                # else: 继续等待更多 token
+
         if spinner:
             spinner.stop()
-        if not self._interrupted:
+        if not self._interrupted and not silent:
             print("\n")
         return buffer.strip()
 
@@ -205,15 +270,22 @@ class LocalModel:
             result += resp.text
         return result.strip()
 
-    def _stream_with_thinking(self, gen, spinner: Spinner, esc: EscListener) -> str:
-        """thinking 阶段转圈，回答阶段流式输出。按 Esc 可打断。"""
+    def _stream_with_thinking(self, gen, spinner: Spinner, esc: EscListener, silent: bool = False) -> str:
+        """thinking 阶段转圈，回答阶段流式输出。按 Esc 可打断。
+        检测到工具标记时停止输出并设置 _tool_detected。
+        """
         buffer = ""
         found_end = False
+        output_buffer = ""  # 已输出的内容（仅回答部分）
+        tool_pending = False  # 是否在等待工具标记闭合
+        tool_start_pos = -1  # 工具标记开始位置（在 buffer 中）
+        printed_header = False
 
         for resp in gen:
             if esc.pressed:
                 self._interrupted = True
-                spinner.stop()
+                if spinner:
+                    spinner.stop()
                 # 保存已有的思考内容
                 thinking_text = buffer
                 for tag in ["<think>", "<think>\n"]:
@@ -222,7 +294,8 @@ class LocalModel:
                 if THINK_END in thinking_text:
                     thinking_text = thinking_text[:thinking_text.index(THINK_END)]
                 self.last_thinking = thinking_text.strip() or None
-                print("\n（已打断）\n")
+                if not silent:
+                    print("\n（已打断）\n")
                 answer_start = buffer.index(THINK_END) + len(THINK_END) if found_end else len(buffer)
                 return buffer[answer_start:].strip()
 
@@ -231,13 +304,66 @@ class LocalModel:
             if not found_end and THINK_END in buffer:
                 found_end = True
                 spinner.stop()
+                spinner = None
                 answer_start = buffer.index(THINK_END) + len(THINK_END)
                 answer_so_far = buffer[answer_start:].lstrip()
-                print(f"\n十五: {answer_so_far}", end="", flush=True)
+                if answer_so_far and not silent:
+                    print(f"\n十五: {answer_so_far}", end="", flush=True)
+                    printed_header = True
+                output_buffer = buffer[:answer_start] + answer_so_far
                 continue
 
             if found_end:
-                print(resp.text, end="", flush=True)
+                # 回答阶段，检测工具标记
+                if not tool_pending:
+                    # 检查是否出现 `[` 开始工具标记
+                    bracket_pos = buffer.find("[", len(output_buffer))
+                    if bracket_pos != -1:
+                        tool_pending = True
+                        tool_start_pos = bracket_pos
+                        # 输出 `[` 之前的内容
+                        before_bracket = buffer[len(output_buffer):bracket_pos]
+                        if before_bracket and not silent:
+                            if not printed_header:
+                                print("\n十五: ", end="", flush=True)
+                                printed_header = True
+                            print(before_bracket, end="", flush=True)
+                            output_buffer += before_bracket
+                        tool_text = buffer[tool_start_pos:]
+                        match = _TOOL_MARKER_RE.match(tool_text)
+                        if match:
+                            self._tool_detected = True
+                            break
+                    else:
+                        # 没有工具标记，正常输出
+                        new_text = buffer[len(output_buffer):]
+                        if new_text and not silent:
+                            if not printed_header:
+                                print("\n十五: ", end="", flush=True)
+                                printed_header = True
+                            print(new_text, end="", flush=True)
+                            output_buffer = buffer
+                else:
+                    # 正在等待工具标记闭合，检查是否匹配完成
+                    tool_text = buffer[tool_start_pos:]
+                    match = _TOOL_MARKER_RE.match(tool_text)
+                    if match:
+                        # 匹配到完整工具标记，停止输出
+                        self._tool_detected = True
+                        break
+                    elif "]" in tool_text:
+                        # 有 `]` 但不是工具标记，恢复输出
+                        tool_pending = False
+                        tool_start_pos = -1
+                        # 输出之前暂停的内容
+                        new_text = buffer[len(output_buffer):]
+                        if new_text and not silent:
+                            if not printed_header:
+                                print("\n十五: ", end="", flush=True)
+                                printed_header = True
+                            print(new_text, end="", flush=True)
+                            output_buffer = buffer
+                    # else: 继续等待更多 token
 
         if not found_end:
             # thinking 没闭合，token 用完了
@@ -247,10 +373,12 @@ class LocalModel:
                 if thinking_text.startswith(tag):
                     thinking_text = thinking_text[len(tag):]
             self.last_thinking = thinking_text.strip()
-            print("\n十五: （思考未完成，用 /thinking 查看思考内容，/tokens <数量> 增大上限）\n")
+            if not silent:
+                print("\n十五: （思考未完成，用 /thinking 查看思考内容，/tokens <数量> 增大上限）\n")
             return ""
 
-        print("\n")
+        if not silent:
+            print("\n")
         answer_start = buffer.index(THINK_END) + len(THINK_END)
         think_start = 0
         for tag in ["<think>", "<think>\n"]:

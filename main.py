@@ -10,7 +10,7 @@ from memory.memory_store import MemoryStore
 from memory.llm_extractor import try_llm_extract, reextract_from_logs_llm
 from prompts.system import SYSTEM_PROMPT
 from tools.web import web_search, web_fetch
-from tools.auto_tool import detect_tool_calls, execute_tool_calls
+from tools.auto_tool import detect_tool_calls, execute_tool_calls, enrich_reply_with_sources, extract_tool_markers
 from tools.canvas import (
     DEFAULT_CANVAS_DAYS,
     canvas_status,
@@ -28,6 +28,7 @@ from tools.canvas import (
 )
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
 from tools.pdf_tools import pdf_merge
+from tools.system_status import get_system_status, infer_status_query
 
 REMEMBER_KIND_RE = re.compile(
     r"^(user_identity|user_preference|project_context|technical_constraint|assistant_identity|other|manual)\s*[:：]\s*(.+)$"
@@ -56,6 +57,7 @@ COMMANDS = {
     "/canvas undo <内容>": "将匹配到的 Canvas 事件改回未完成",
     "/files": "列出 shared_files/ 中可用 @引用 的文件",
     "/pdfmerge <文件夹> <输出名>": "合并文件夹内所有 PDF",
+    "/sys [项]": "查看系统状态（battery/cpu/memory/disk/network/foreground/processes/ports/all）",
     "/help": "显示可用命令",
 }
 
@@ -65,6 +67,17 @@ def print_help():
     for cmd, desc in COMMANDS.items():
         print(f"  {cmd:20s} {desc}")
     print()
+
+
+def _print_appended_reply_delta(original: str, enriched: str):
+    if enriched == original:
+        return
+    if enriched.startswith(original):
+        suffix = enriched[len(original):]
+        if suffix:
+            print(suffix)
+        return
+    print(f"\n{enriched}")
 
 
 def main():
@@ -222,6 +235,9 @@ def main():
                 print(f"生成回复时出错: {e}\n")
                 conv.history.pop()
                 continue
+            enriched = enrich_reply_with_sources(reply, raw_results)
+            _print_appended_reply_delta(reply, enriched)
+            reply = enriched
             conv.add_assistant(reply)
             mem.append_log("assistant", reply)
             continue
@@ -246,6 +262,9 @@ def main():
                 print(f"生成回复时出错: {e}\n")
                 conv.history.pop()
                 continue
+            enriched = enrich_reply_with_sources(reply, raw_content)
+            _print_appended_reply_delta(reply, enriched)
+            reply = enriched
             conv.add_assistant(reply)
             mem.append_log("assistant", reply)
             continue
@@ -314,6 +333,10 @@ def main():
                 continue
             print(f"{get_canvas_schedule(days=days)}\n")
             continue
+        elif user_input.startswith("/sys"):
+            query = user_input[len("/sys"):].strip() or "all"
+            print(f"\n{get_system_status(query)}\n")
+            continue
         elif user_input == "/files":
             files = list_shared_files()
             if files:
@@ -344,6 +367,32 @@ def main():
             continue
 
         # ---- 对话处理 ----
+
+        status_query = infer_status_query(user_input)
+        if status_query:
+            spinner = Spinner(f"正在获取系统状态: {status_query}")
+            spinner.start()
+            raw_status = get_system_status(status_query)
+            spinner.stop()
+            conv.add_user(
+                f"{user_input}\n\n"
+                f"【系统临时注入的本机实时状态，不属于长期记忆】\n{raw_status}\n\n"
+                "请根据这些实时状态直接回答，不要再次请求工具。回答末尾注明来源：本地系统状态工具（实时读取）。"
+            )
+            mem.append_log("user", user_input)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
+            try:
+                reply = model.chat(messages)
+            except Exception as e:
+                print(f"生成回复时出错: {e}\n")
+                conv.history.pop()
+                continue
+            enriched = enrich_reply_with_sources(reply, f"【系统状态】\n{raw_status}")
+            _print_appended_reply_delta(reply, enriched)
+            reply = enriched
+            conv.add_assistant(reply)
+            mem.append_log("assistant", reply)
+            continue
 
         if should_mark_canvas_pending(user_input):
             result = mark_canvas_events_pending(user_input)
@@ -414,25 +463,31 @@ def main():
             continue
 
         # 检测模型是否想调用工具
-        tool_calls = detect_tool_calls(reply)
-        if tool_calls:
-            skip_memory_extract = True
-            # 执行工具调用
-            tool_results = execute_tool_calls(tool_calls)
-            # 把第一轮回复（含标记）和工具结果都加入对话
-            conv.add_assistant(reply)
-            conv.add_user(
-                f"以下是你请求的工具执行结果，请据此给出完整回答。\n"
-                f"要求：直接用自然语言总结要点，回答末尾附上引用来源链接。\n\n"
-                f"{tool_results}"
-            )
-            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
-            try:
-                reply = model.chat(messages)
-            except Exception as e:
-                print(f"生成回复时出错: {e}\n")
-                conv.history.pop()
-                continue
+        if model._tool_detected:
+            # 流式输出已停止，reply 中包含工具标记
+            tool_calls = detect_tool_calls(reply)
+            if tool_calls:
+                skip_memory_extract = True
+                # 执行工具调用
+                tool_results = execute_tool_calls(tool_calls)
+                # 只把工具标记写回对话，避免把第一轮的半成品回答污染第二轮上下文
+                conv.add_assistant(extract_tool_markers(reply) or reply)
+                conv.add_user(
+                    f"以下是你请求的工具执行结果，请据此给出完整回答。\n"
+                    f"要求：直接用自然语言总结要点。不要再次请求工具。"
+                    f"回答末尾必须附上你实际使用到的引用来源 URL。\n\n"
+                    f"{tool_results}"
+                )
+                messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
+                try:
+                    reply = model.chat(messages)
+                except Exception as e:
+                    print(f"生成回复时出错: {e}\n")
+                    conv.history.pop()
+                    continue
+                enriched = enrich_reply_with_sources(reply, tool_results)
+                _print_appended_reply_delta(reply, enriched)
+                reply = enriched
 
         conv.add_assistant(reply)
         mem.append_log("assistant", reply)
