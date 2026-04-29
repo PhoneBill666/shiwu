@@ -146,7 +146,8 @@ def main():
                 f"\n  扫描日志: {stats['scanned_logs']}"
                 f"\n  处理批次: {stats['batches']}"
                 f"\n  新增记忆: {stats['added']}"
-                f"\n  重复跳过: {stats['duplicates']}\n"
+                f"\n  重复跳过: {stats['duplicates']}"
+                f"\n  墓碑拦截: {stats.get('tombstoned', 0)}\n"
             )
             continue
         elif user_input == "/model":

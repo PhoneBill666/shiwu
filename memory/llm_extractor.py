@@ -43,6 +43,10 @@ EXTRACTION_SYSTEM = (
     "例如：已有「回答风格必须直接」，就不要再提取「用户希望回答风格准确直接」。\n"
     "只提取已有记忆中**完全没有覆盖**的新信息。\n"
     "\n"
+    "## 墓碑规则（极其重要）\n"
+    "如果下方提供了“已删除/禁止恢复的记忆”，这些内容说明用户明确不想保留。\n"
+    "只要语义相同或高度相似，即使换一种说法，也**绝对不要重新提取**。\n"
+    "\n"
     "## 输出格式\n"
     "只输出 JSON，不要输出任何其他文字：\n"
     '{"memories": [{"kind": "类型", "content": "一句话总结"}]}\n'
@@ -74,7 +78,7 @@ def _build_user_prompt(
 
 def _get_existing_summaries(store: MemoryStore) -> str:
     """按类型分组展示所有已有记忆，不截断，让模型看到完整内容以判断重复。"""
-    if not store.memories:
+    if not store.memories and not store.tombstones:
         return ""
 
     by_kind: dict[str, list[str]] = {}
@@ -97,7 +101,28 @@ def _get_existing_summaries(store: MemoryStore) -> str:
         lines.append(f"### {label}")
         for item in items:
             lines.append(f"- {item}")
+
+    tombstone_items = _get_tombstone_summaries(store)
+    if tombstone_items:
+        lines.append("### 已删除/禁止恢复的记忆")
+        for item in tombstone_items:
+            lines.append(f"- {item}")
     return "\n".join(lines)
+
+
+def _get_tombstone_summaries(store: MemoryStore) -> list[str]:
+    items: list[str] = []
+    for tombstone in store.tombstones:
+        content = tombstone.get("content")
+        if not isinstance(content, str) or not content.strip():
+            canonical_key = tombstone.get("canonical_key", "")
+            if isinstance(canonical_key, str) and ":" in canonical_key:
+                content = canonical_key.split(":", 1)[1]
+            else:
+                continue
+        kind = tombstone.get("kind", "other")
+        items.append(f"({kind}) {content.strip()}")
+    return items
 
 
 # ---- 去重逻辑 ----
@@ -135,6 +160,45 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
+def _is_semantically_similar(content: str, kind: str, existing_kind: str, existing_content: str) -> bool:
+    content_clean = re.sub(r"\s+", "", content.lower())
+    existing_clean = re.sub(r"\s+", "", existing_content.lower())
+
+    if content_clean in existing_clean or existing_clean in content_clean:
+        return True
+
+    new_keywords = _extract_keywords(content)
+    existing_keywords = _extract_keywords(existing_content)
+    kw_sim = _jaccard(new_keywords, existing_keywords)
+    threshold = 0.35 if existing_kind == kind else 0.50
+    if kw_sim >= threshold:
+        return True
+
+    new_trigrams = _extract_trigrams(content)
+    existing_trigrams = _extract_trigrams(existing_content)
+    shared = new_trigrams & existing_trigrams
+    return len(shared) >= 2
+
+
+def _is_tombstone_match(content: str, kind: str, store: MemoryStore) -> bool:
+    key = build_canonical_key(kind, content)
+    if store.is_tombstoned(key):
+        return True
+
+    for tombstone in store.tombstones:
+        existing_content = tombstone.get("content")
+        if not isinstance(existing_content, str) or not existing_content.strip():
+            canonical_key = tombstone.get("canonical_key", "")
+            if isinstance(canonical_key, str) and ":" in canonical_key:
+                existing_content = canonical_key.split(":", 1)[1]
+            else:
+                continue
+        existing_kind = tombstone.get("kind", "other")
+        if _is_semantically_similar(content, kind, str(existing_kind), existing_content):
+            return True
+    return False
+
+
 def _is_duplicate(content: str, kind: str, store: MemoryStore) -> bool:
     """检查新提取的记忆是否和已有记忆语义重复。
 
@@ -143,35 +207,18 @@ def _is_duplicate(content: str, kind: str, store: MemoryStore) -> bool:
     2. 子串包含
     3. 关键字 Jaccard ≥ 0.35 或共享三字短语 ≥ 2
     """
-    key = build_canonical_key(kind, content)
-    if store.is_tombstoned(key):
+    if _is_tombstone_match(content, kind, store):
         return True
+
+    key = build_canonical_key(kind, content)
     if store.find_by_canonical_key(key):
         return True
 
-    content_clean = re.sub(r"\s+", "", content.lower())
-    new_keywords = _extract_keywords(content)
-    new_trigrams = _extract_trigrams(content)
-
     for existing in store.memories:
         existing_content = existing.get("content", "")
-        existing_clean = re.sub(r"\s+", "", existing_content.lower())
-
-        # 子串匹配（跨 kind）
-        if content_clean in existing_clean or existing_clean in content_clean:
-            return True
-
-        # 关键字 Jaccard（同 kind 更严格）
-        existing_keywords = _extract_keywords(existing_content)
-        kw_sim = _jaccard(new_keywords, existing_keywords)
-        threshold = 0.35 if existing.get("kind") == kind else 0.50
-        if kw_sim >= threshold:
-            return True
-
-        # 共享三字短语检测（捕获措辞不同但概念相同的情况）
-        existing_trigrams = _extract_trigrams(existing_content)
-        shared = new_trigrams & existing_trigrams
-        if len(shared) >= 2:
+        if not isinstance(existing_content, str) or not existing_content.strip():
+            continue
+        if _is_semantically_similar(content, kind, str(existing.get("kind", "other")), existing_content):
             return True
 
     return False
@@ -276,6 +323,7 @@ def reextract_from_logs_llm(
         "batches": 0,
         "added": 0,
         "duplicates": 0,
+        "tombstoned": 0,
     }
 
     spinner = Spinner("离线补提炼中")
@@ -319,6 +367,10 @@ def reextract_from_logs_llm(
                 if len(content) < 6:
                     continue
                 if kind not in VALID_KINDS:
+                    continue
+                if _is_tombstone_match(content, kind, store):
+                    stats["tombstoned"] += 1
+                    stats["duplicates"] += 1
                     continue
                 if _is_duplicate(content, kind, store):
                     stats["duplicates"] += 1

@@ -172,18 +172,21 @@ class MemoryStore:
 
     def add_tombstone(self, kind: str, content: str, source: str = "manual") -> dict:
         norm_kind = _normalize_kind(kind)
+        content = content.strip()
         key = build_canonical_key(norm_kind, content)
         now = _now_iso()
         existing = next((m for m in self.tombstones if m.get("canonical_key") == key), None)
         if existing:
             existing["updated_at"] = now
             existing["source"] = source
+            existing["content"] = content
             self._save_tombstones()
             return existing
 
         item = {
             "id": uuid.uuid4().hex[:8],
             "kind": norm_kind,
+            "content": content,
             "canonical_key": key,
             "source": source,
             "created_at": now,
@@ -350,6 +353,10 @@ class MemoryStore:
                 if not isinstance(kind, str):
                     kind = ckey.split(":", 1)[0] if ":" in ckey else "other"
                 kind = _normalize_kind(kind)
+                content = raw.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    content = ckey.split(":", 1)[1] if ":" in ckey else ""
+                content = content.strip()
                 source = raw.get("source") if isinstance(raw.get("source"), str) else "legacy"
                 created_at = raw.get("created_at") if isinstance(raw.get("created_at"), str) else now
                 updated_at = raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else created_at
@@ -360,6 +367,7 @@ class MemoryStore:
                     {
                         "id": tid,
                         "kind": kind,
+                        "content": content,
                         "canonical_key": ckey,
                         "source": source,
                         "created_at": created_at,
