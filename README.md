@@ -9,6 +9,7 @@
 - 联网搜索：模型可自主判断是否需要搜索，也可手动 `/search`、`/fetch`
 - Canvas 日程：支持通过 Canvas Calendar Feed 查看临近作业 due、考试和近期安排
 - 文件阅读：支持 PDF、Word、纯文本等，通过 `@文件名` 或 `[/路径]` 引用
+- 安全命令执行底座：工具层通过 `tools/shell_control.py` 统一执行本机命令、记录审计日志、管理后台任务
 - 多模型切换
 
 ## 环境要求
@@ -82,4 +83,11 @@ data/
   canvas_data/
     canvas_config.json
     canvas_history.json
+runtime/
+  tasks/
+    shell_tasks.json
+  logs/
+    shell_control.log
+    tasks/
+      <task_id>.log
 ```

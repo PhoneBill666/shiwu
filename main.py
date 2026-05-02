@@ -34,6 +34,7 @@ from tools.canvas import (
     should_auto_check_canvas,
 )
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
+from tools.path_finder import find_paths, infer_path_query
 from tools.pdf_tools import pdf_merge
 from tools.system_status import get_system_status, infer_status_query
 
@@ -97,6 +98,8 @@ def _tool_result_spinner_messages(tool_calls: list[tuple[str, str]]) -> tuple[st
         return "正在整理网页内容", "正在生成回答"
     if "FILE" in actions:
         return "正在整理文件内容", "正在生成回答"
+    if "PATH" in actions:
+        return "正在整理路径结果", "正在生成回答"
     if "PDFMERGE" in actions:
         return "正在整理 PDF 结果", "正在生成回答"
     if "CANVAS" in actions:
@@ -403,6 +406,37 @@ def main():
             continue
 
         # ---- 对话处理 ----
+
+        path_query = infer_path_query(user_input)
+        if path_query:
+            name, kind = path_query
+            spinner = Spinner(f"正在查找路径: {name}")
+            spinner.start()
+            raw_paths = find_paths(name, kind=kind)
+            spinner.stop()
+            conv.add_user(
+                f"{user_input}\n\n"
+                f"【系统临时注入的本机路径查找结果，不属于长期记忆】\n{raw_paths}\n\n"
+                "请根据这些本机路径查找结果直接回答。回答末尾注明来源：本地路径查找工具。"
+            )
+            mem.append_log("user", user_input)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
+            try:
+                reply = model.chat(
+                    messages,
+                    spinner_message="正在整理路径结果",
+                    next_spinner_message="正在生成回答",
+                )
+            except Exception as e:
+                print(f"生成回复时出错: {e}\n")
+                conv.history.pop()
+                continue
+            enriched = enrich_reply_with_sources(reply, "【路径查找】\n" + raw_paths)
+            _print_appended_reply_delta(reply, enriched)
+            reply = enriched
+            conv.add_assistant(reply)
+            mem.append_log("assistant", reply)
+            continue
 
         status_query = infer_status_query(user_input)
         if status_query:

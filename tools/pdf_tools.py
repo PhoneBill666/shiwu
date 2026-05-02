@@ -2,7 +2,8 @@
 
 import os
 import glob
-import subprocess
+
+from tools.shell_control import run
 
 
 def pdf_merge(folder: str, output: str) -> str:
@@ -22,17 +23,12 @@ def pdf_merge(folder: str, output: str) -> str:
     if not output.lower().endswith(".pdf"):
         output += ".pdf"
 
-    try:
-        subprocess.run(
-            ["pdfunite", *pdf_files, output],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
+    result = run(["pdfunite", *pdf_files, output], timeout=120)
+    if result.error and "No such file or directory" in result.error:
         return "pdfunite 未安装，请运行: brew install poppler"
-    except subprocess.CalledProcessError as e:
-        return f"合并失败: {e.stderr.strip()}"
+    if not result.ok:
+        detail = result.stderr.strip() or result.error or "未知错误"
+        return f"合并失败: {detail}"
 
     filenames = [os.path.basename(f) for f in pdf_files]
     return (

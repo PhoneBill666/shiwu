@@ -13,8 +13,9 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 from dataclasses import dataclass
+
+from tools.shell_control import run
 
 DEFAULT_MAIL_LIMIT = 5
 MAX_MAIL_LIMIT = 8
@@ -363,11 +364,8 @@ def _mdfind_mail(keywords: list[str]) -> list[str]:
             f"kMDItemDisplayName == '*{kw_lower}'c)"
         )
     query_str = " || ".join(keyword_clauses)
-    result = subprocess.run(
-        ["mdfind", "-onlyin", MAIL_DIR, query_str],
-        capture_output=True, text=True, timeout=MDFIND_TIMEOUT,
-    )
-    if result.returncode != 0:
+    result = run(["mdfind", "-onlyin", MAIL_DIR, query_str], timeout=MDFIND_TIMEOUT)
+    if result.exit_code != 0:
         return []
     paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return [p for p in paths if p.lower().endswith(".emlx")]
@@ -466,12 +464,13 @@ def _fetch_mail_gui_search(*, keywords: list[str], limit: int,
     }
     env = os.environ.copy()
     env["SHIWU_MAIL_QUERY"] = json.dumps(payload, ensure_ascii=False)
-    result = subprocess.run(
+    result = run(
         ["osascript", "-l", "JavaScript", "-e", script],
-        capture_output=True, text=True, timeout=45, env=env,
+        timeout=45,
+        env=env,
     )
-    if result.returncode != 0:
-        error = (result.stderr or result.stdout or "未知错误").strip()
+    if result.exit_code != 0:
+        error = (result.stderr or result.stdout or result.error or "未知错误").strip()
         raise RuntimeError(error)
     output = (result.stdout or "").strip()
     if not output:
@@ -538,12 +537,13 @@ function run() {
     }
     env = os.environ.copy()
     env["SHIWU_MAIL_QUERY"] = json.dumps(payload, ensure_ascii=False)
-    result = subprocess.run(
+    result = run(
         ["osascript", "-l", "JavaScript", "-e", script],
-        capture_output=True, text=True, timeout=15, env=env,
+        timeout=15,
+        env=env,
     )
-    if result.returncode != 0:
-        error = (result.stderr or result.stdout or "未知错误").strip()
+    if result.exit_code != 0:
+        error = (result.stderr or result.stdout or result.error or "未知错误").strip()
         raise RuntimeError(error)
     output = (result.stdout or "").strip()
     if not output:

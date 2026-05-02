@@ -10,7 +10,7 @@ import select
 from mlx_lm import load, stream_generate
 
 # 匹配工具标记 [ACTION:argument]
-_TOOL_MARKER_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
+_TOOL_MARKER_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PATH|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
 
 # DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-4bit"

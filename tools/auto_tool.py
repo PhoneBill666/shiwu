@@ -1,19 +1,21 @@
 """自动工具调用：检测模型回复中的工具标记并执行。
 
-支持: [SEARCH:...] [FETCH:...] [FILE:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...] [MAIL:query]
+支持: [SEARCH:...] [FETCH:...] [FILE:...] [PATH:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...] [MAIL:query]
 """
 
 import re
+import sys
 
 from tools.web import web_search, web_fetch
 from tools.file_reader import read_file
+from tools.path_finder import find_paths
 from tools.pdf_tools import pdf_merge
 from tools.canvas import get_canvas_schedule, normalize_canvas_days
 from tools.system_status import get_system_status
 from tools.mail_tool import search_mail
 
 # 匹配所有工具标记
-_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
+_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PATH|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
 
 # 最多执行几次工具调用（防止循环）
@@ -88,6 +90,8 @@ def _infer_local_source_label(tool_results: str) -> str:
         return "macOS Mail 应用（本地读取）"
     if "【文件:" in tool_results:
         return "本地文件读取"
+    if "【路径查找】" in tool_results:
+        return "本地路径查找工具"
     if "【PDF 合并】" in tool_results:
         return "本地 PDF 合并工具"
     return ""
@@ -111,9 +115,19 @@ def source_instruction_for_tool_results(tool_results: str) -> str:
 
 
 def _make_spinner(message: str):
-    from core.model import Spinner
+    model_module = sys.modules.get("core.model")
+    spinner_class = getattr(model_module, "Spinner", None) if model_module else None
+    if spinner_class:
+        return spinner_class(message)
 
-    return Spinner(message)
+    class _NoopSpinner:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    return _NoopSpinner()
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -151,6 +165,12 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
             result = read_file(path)
             spinner.stop()
             results.append(f"【文件: {argument}】\n{result}")
+        elif action == "PATH":
+            spinner = _make_spinner(f"正在查找路径: {argument}")
+            spinner.start()
+            result = find_paths(argument, kind="directory")
+            spinner.stop()
+            results.append(f"【路径查找】\n{result}")
         elif action == "PDFMERGE":
             parts = argument.split("|", 1)
             if len(parts) == 2:
