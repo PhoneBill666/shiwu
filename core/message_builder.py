@@ -1,3 +1,4 @@
+from core.directory_context import build_directory_context
 from core.temporal_context import build_runtime_context, query_mentions_past_time
 from memory.conversation import Conversation
 from memory.memory_retriever import retrieve, format_for_prompt
@@ -23,6 +24,10 @@ def build_messages(
     system_parts: list[str] = [system_prompt]
 
     system_parts.append(build_runtime_context(model_name=model_name))
+
+    directory_context = build_directory_context(user_query)
+    if directory_context:
+        system_parts.append(directory_context)
 
     # 长期记忆
     relevant = retrieve(user_query, memory_store)

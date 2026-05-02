@@ -8,7 +8,7 @@ import sys
 
 from tools.web import web_search, web_fetch
 from tools.file_reader import read_file
-from tools.path_finder import find_paths
+from tools.path_finder import find_paths, infer_kind_from_name
 from tools.pdf_tools import pdf_merge
 from tools.canvas import get_canvas_schedule, normalize_canvas_days
 from tools.system_status import get_system_status
@@ -168,7 +168,7 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
         elif action == "PATH":
             spinner = _make_spinner(f"正在查找路径: {argument}")
             spinner.start()
-            result = find_paths(argument, kind="directory")
+            result = find_paths(argument, kind=infer_kind_from_name(argument))
             spinner.stop()
             results.append(f"【路径查找】\n{result}")
         elif action == "PDFMERGE":

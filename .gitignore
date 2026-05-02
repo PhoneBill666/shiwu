@@ -26,6 +26,7 @@ AGENTS.md
 # User data (memories, logs, sessions)
 data/
 runtime/
+COMPUTER_DIRECTORY_MAP.md
 
 # Shared files (user-uploaded)
 shared_files/
