@@ -33,7 +33,9 @@ from tools.canvas import (
     should_mark_canvas_pending,
     should_auto_check_canvas,
 )
+from tools.file_opener import extract_paths_from_text, infer_open_request, open_recent
 from tools.file_reader import parse_file_references, strip_file_references, read_all_references, list_shared_files
+from tools.local_search import execute_local_search, infer_local_search_query
 from tools.path_finder import find_paths, infer_path_query
 from tools.pdf_tools import pdf_merge
 from tools.system_status import get_system_status, infer_status_query
@@ -100,6 +102,8 @@ def _tool_result_spinner_messages(tool_calls: list[tuple[str, str]]) -> tuple[st
         return "正在整理文件内容", "正在生成回答"
     if "PATH" in actions:
         return "正在整理路径结果", "正在生成回答"
+    if "LOCAL" in actions:
+        return "正在整理本机搜索结果", "正在生成回答"
     if "PDFMERGE" in actions:
         return "正在整理 PDF 结果", "正在生成回答"
     if "CANVAS" in actions:
@@ -116,6 +120,7 @@ def main():
     conv = Conversation()
     mem = MemoryStore()
     input_history = InMemoryHistory()
+    recent_file_paths: list[str] = []
 
     print("\n本地助手已启动，输入你的问题开始对话。")
     print("输入 /help 查看命令列表。\n")
@@ -407,6 +412,52 @@ def main():
 
         # ---- 对话处理 ----
 
+        open_reference = infer_open_request(user_input)
+        if open_reference is not None:
+            result, opened_path = open_recent(open_reference, recent_file_paths)
+            print(f"\n{result}\n")
+            conv.add_user(user_input)
+            conv.add_assistant(result)
+            mem.append_log("user", user_input)
+            mem.append_log("assistant", result)
+            if opened_path and opened_path in recent_file_paths:
+                recent_file_paths.remove(opened_path)
+                recent_file_paths.insert(0, opened_path)
+            continue
+
+        local_search_query = infer_local_search_query(user_input)
+        if local_search_query:
+            spinner = Spinner(f"正在本机搜索: {local_search_query}")
+            spinner.start()
+            raw_search = execute_local_search(local_search_query)
+            spinner.stop()
+            found_paths = extract_paths_from_text(raw_search)
+            if found_paths:
+                recent_file_paths = found_paths
+            conv.add_user(
+                f"{user_input}\n\n"
+                f"【系统临时注入的本机只读搜索结果，不属于长期记忆】\n{raw_search}\n\n"
+                "请根据这些本机搜索结果直接回答。回答末尾注明来源：本机只读搜索工具。"
+            )
+            mem.append_log("user", user_input)
+            messages = build_messages(SYSTEM_PROMPT, conv, mem, user_input, model.model_name)
+            try:
+                reply = model.chat(
+                    messages,
+                    spinner_message="正在整理本机搜索结果",
+                    next_spinner_message="正在生成回答",
+                )
+            except Exception as e:
+                print(f"生成回复时出错: {e}\n")
+                conv.history.pop()
+                continue
+            enriched = enrich_reply_with_sources(reply, "【本机搜索】\n" + raw_search)
+            _print_appended_reply_delta(reply, enriched)
+            reply = enriched
+            conv.add_assistant(reply)
+            mem.append_log("assistant", reply)
+            continue
+
         path_query = infer_path_query(user_input)
         if path_query:
             name, kind = path_query
@@ -414,6 +465,9 @@ def main():
             spinner.start()
             raw_paths = find_paths(name, kind=kind)
             spinner.stop()
+            found_paths = extract_paths_from_text(raw_paths)
+            if found_paths:
+                recent_file_paths = found_paths
             conv.add_user(
                 f"{user_input}\n\n"
                 f"【系统临时注入的本机路径查找结果，不属于长期记忆】\n{raw_paths}\n\n"
@@ -544,6 +598,9 @@ def main():
                 skip_memory_extract = True
                 # 执行工具调用
                 tool_results = execute_tool_calls(tool_calls)
+                found_paths = extract_paths_from_text(tool_results)
+                if found_paths:
+                    recent_file_paths = found_paths
                 # 只把工具标记写回对话，避免把第一轮的半成品回答污染第二轮上下文
                 conv.add_assistant(extract_tool_markers(reply) or reply)
                 conv.add_user(

@@ -1,6 +1,6 @@
 """自动工具调用：检测模型回复中的工具标记并执行。
 
-支持: [SEARCH:...] [FETCH:...] [FILE:...] [PATH:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...] [MAIL:query]
+支持: [SEARCH:...] [FETCH:...] [FILE:...] [PATH:...] [LOCAL:...] [PDFMERGE:folder|output] [CANVAS:days] [STATUS:...] [MAIL:query]
 """
 
 import re
@@ -8,6 +8,7 @@ import sys
 
 from tools.web import web_search, web_fetch
 from tools.file_reader import read_file
+from tools.local_search import execute_local_search
 from tools.path_finder import find_paths, infer_kind_from_name
 from tools.pdf_tools import pdf_merge
 from tools.canvas import get_canvas_schedule, normalize_canvas_days
@@ -15,7 +16,7 @@ from tools.system_status import get_system_status
 from tools.mail_tool import search_mail
 
 # 匹配所有工具标记
-_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PATH|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
+_TOOL_RE = re.compile(r"\[(SEARCH|FETCH|FILE|PATH|LOCAL|PDFMERGE|CANVAS|STATUS|MAIL):([^\]]+)\]")
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
 
 # 最多执行几次工具调用（防止循环）
@@ -92,6 +93,8 @@ def _infer_local_source_label(tool_results: str) -> str:
         return "本地文件读取"
     if "【路径查找】" in tool_results:
         return "本地路径查找工具"
+    if "【本机搜索】" in tool_results:
+        return "本机只读搜索工具"
     if "【PDF 合并】" in tool_results:
         return "本地 PDF 合并工具"
     return ""
@@ -171,6 +174,12 @@ def execute_tool_calls(calls: list[tuple[str, str]]) -> str:
             result = find_paths(argument, kind=infer_kind_from_name(argument))
             spinner.stop()
             results.append(f"【路径查找】\n{result}")
+        elif action == "LOCAL":
+            spinner = _make_spinner(f"正在本机搜索: {argument}")
+            spinner.start()
+            result = execute_local_search(argument)
+            spinner.stop()
+            results.append(f"【本机搜索】\n{result}")
         elif action == "PDFMERGE":
             parts = argument.split("|", 1)
             if len(parts) == 2:

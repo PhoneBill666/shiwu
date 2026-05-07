@@ -67,6 +67,7 @@ SAFE_COMMANDS = {
     "tail",
     "wc",
     "grep",
+    "rg",
     "find",
     "du",
     "df",
